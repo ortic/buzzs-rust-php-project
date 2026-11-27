@@ -5646,7 +5646,8 @@ impl Vm {
     /// variable's value straight from the table
     /// ([`Vm::fetch_global_by_key_optional`]), without the place walk
     /// (MediaWiki's `GlobalVarConfig` asks this for every setting it
-    /// reads). `None` for `empty()`, any other place or name.
+    /// reads). `None` for `empty()`, any other place or name, and the
+    /// name of an auto-global.
     fn isset_global_fast(&mut self, pid: PlaceId, empty: bool) -> Option<bool> {
         if empty {
             return None;
@@ -5664,7 +5665,14 @@ impl Vm {
             Operand::Lit(l) => f.code.literals.get(l as usize)?,
             _ => return None,
         };
-        if !matches!(k, Value::Str(_)) {
+        let Value::Str(name) = k else {
+            return None;
+        };
+        // An auto-global's name is the walk's: `isset()` does not create
+        // one that is still armed (`auto_globals_jit`), which the fetch
+        // below would.
+        let bytes = name.as_bytes();
+        if bytes.first() == Some(&b'_') && crate::auto_globals::index(bytes).is_some() {
             return None;
         }
         let k = k.clone();
