@@ -34,7 +34,7 @@ pub(super) enum Handle {
 
 /// A candidate node: its handle and its children. What every edge into
 /// it reads or writes (the count of such edges, the marks) is kept beside
-/// the node list, in [`Graph::internal`] and [`Graph::flags`]: a few
+/// the node list, in [`Graph::counts`] and [`Graph::flags`]: a few
 /// bytes a node, in one block each, where the nodes are 32 bytes each in
 /// chunks. Those are the random accesses of a run (one per edge while the
 /// graph is built, one per edge while liveness spreads).
@@ -43,6 +43,20 @@ pub(super) struct Node {
     /// Children: `edges[start..start + len]`.
     start: u32,
     len: u32,
+}
+
+/// A node's reference counts ([`Graph::counts`]).
+#[derive(Clone, Copy)]
+struct Counts {
+    /// The references from candidate nodes (edges into the node).
+    internal: u32,
+    /// The handles other than the graph's own, read when the node is
+    /// expanded (its allocation is at hand then; the counts do not move
+    /// while the graph is built: nothing runs, and the graph takes its
+    /// one handle of a node before it expands it). The scan then decides
+    /// liveness from this array and the marks alone, without a second
+    /// walk over every object, array and reference of the heap.
+    others: u32,
 }
 
 /// [`Graph::flags`]: for objects, an edge to the object was seen (objects
@@ -147,8 +161,9 @@ pub(super) struct Graph {
     pub nodes: Nodes,
     /// Per node: `REACHED`, `PINNED`, `LIVE`.
     flags: Vec<u8>,
-    /// Per node: the references from candidate nodes (edges into it).
-    internal: Vec<u32>,
+    /// Per node, its two counts side by side (one entry to add, one line
+    /// of memory to read in the scan).
+    counts: Vec<Counts>,
     /// Object nodes by object handle (`NONE`: not in the graph). Handles
     /// are dense and cannot be reused while the graph holds the objects;
     /// this costs 4 bytes per handle instead of a hash entry per node.
@@ -204,7 +219,10 @@ impl Graph {
             len: 0,
         });
         self.flags.push(if reached { REACHED } else { 0 });
-        self.internal.push(0);
+        self.counts.push(Counts {
+            internal: 0,
+            others: u32::MAX,
+        });
         i
     }
 
@@ -282,8 +300,8 @@ impl Graph {
     /// One more edge into node `t`.
     #[inline]
     fn count_edge(&mut self, t: u32) {
-        if let Some(n) = self.internal.get_mut(t as usize) {
-            *n += 1;
+        if let Some(n) = self.counts.get_mut(t as usize) {
+            n.internal += 1;
         }
     }
 
@@ -341,6 +359,20 @@ impl Graph {
         let handle = std::mem::replace(&mut self.nodes[i].handle, Handle::Taken);
         let start = self.edges.len();
         let me = u32::try_from(i).unwrap_or(NONE - 1);
+        let strong = match &handle {
+            Handle::Obj(o) => o.refcount(),
+            Handle::Arr(a) => a.refcount(),
+            Handle::Ref(r) => r.refcount(),
+            Handle::Taken => 0,
+        };
+        if let Some(n) = self.counts.get_mut(i) {
+            // The graph holds one handle. (A count that does not fit
+            // reads as a node with outside references: live.)
+            n.others = strong
+                .checked_sub(1)
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(u32::MAX);
+        }
         match &handle {
             Handle::Obj(o) => self.expand_object(me, object::data(o)),
             Handle::Arr(a) => {
@@ -407,9 +439,8 @@ impl Graph {
         // Counted as they are marked: no pass over the nodes for the sum.
         let mut live_nodes = 0usize;
         let mut i: u32 = 0;
-        let marks = self.flags.iter_mut().zip(&self.internal);
-        for (node, (mark, &internal)) in self.nodes.iter().zip(marks) {
-            if *mark & PINNED != 0 || external_refs(node, *mark, internal) != Some(0) {
+        for (mark, n) in self.flags.iter_mut().zip(&self.counts) {
+            if *mark & PINNED != 0 || has_outside_refs(*mark, n.others, n.internal) {
                 *mark |= LIVE;
                 live_nodes += 1;
                 work.push(i);
@@ -457,7 +488,7 @@ impl Graph {
         self.cond = Vec::new();
         self.obj_index = Vec::new();
         self.index = FxHashMap::default();
-        self.internal = Vec::new();
+        self.counts = Vec::new();
     }
 
     /// Children of `i` (edges plus the `WeakMap` values it holds or keys).
@@ -479,18 +510,13 @@ fn obj_node_in(obj_index: &[u32], h: u32) -> Option<u32> {
     obj_index.get(h as usize).copied().filter(|&i| i != NONE)
 }
 
-/// References to `n` from outside the candidate subgraph, or `None` when
-/// they cannot be determined (the node is then live).
-fn external_refs(n: &Node, flags: u8, internal: u32) -> Option<usize> {
-    let strong = match &n.handle {
-        // Reached through no edge: every reference to it is external.
-        Handle::Obj(_) if flags & REACHED == 0 => return None,
-        Handle::Obj(o) => o.refcount(),
-        Handle::Arr(a) => a.refcount(),
-        Handle::Ref(r) => r.refcount(),
-        Handle::Taken => return None,
-    };
-    // The graph holds one handle; a negative remainder would mean an edge
-    // was enumerated twice — treat as live.
-    strong.checked_sub(1 + internal as usize).or(Some(1))
+/// Whether a node has references from outside the candidate subgraph
+/// (it is then live): `others` handles besides the graph's, `internal` of
+/// them from candidate nodes.
+#[inline]
+fn has_outside_refs(flags: u8, others: u32, internal: u32) -> bool {
+    // An object reached through no edge (found in the object store):
+    // every reference to it is external. Fewer handles than edges would
+    // mean an edge was enumerated twice: live.
+    flags & REACHED == 0 || others != internal
 }
